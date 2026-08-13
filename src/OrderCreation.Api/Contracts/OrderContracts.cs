@@ -9,10 +9,12 @@ public sealed record CreateOrderRequest
     [RegularExpression(@"^[A-Za-z0-9._/-]+$", ErrorMessage = "Symbol has an invalid format.")]
     public required string Symbol { get; init; }
 
-    [Range(typeof(decimal), "0.00000001", "1000000000000")]
+    [Range(typeof(decimal), "0.00000001", "1000000000000",
+        ParseLimitsInInvariantCulture = true)]
     public decimal Price { get; init; }
 
-    [Range(typeof(decimal), "0.00000001", "1000000000000")]
+    [Range(typeof(decimal), "0.00000001", "1000000000000",
+        ParseLimitsInInvariantCulture = true)]
     public decimal Volume { get; init; }
 
     [Required]

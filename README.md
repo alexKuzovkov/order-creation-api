@@ -60,10 +60,12 @@ public sealed record CreateOrderRequest
     [RegularExpression(@"^[A-Za-z0-9._/-]+$")]
     public required string Symbol { get; init; }
 
-    [Range(typeof(decimal), "0.00000001", "1000000000000")]
+    [Range(typeof(decimal), "0.00000001", "1000000000000",
+        ParseLimitsInInvariantCulture = true)]
     public decimal Price { get; init; }
 
-    [Range(typeof(decimal), "0.00000001", "1000000000000")]
+    [Range(typeof(decimal), "0.00000001", "1000000000000",
+        ParseLimitsInInvariantCulture = true)]
     public decimal Volume { get; init; }
 
     [Required, StringLength(100, MinimumLength = 8)]
@@ -116,3 +118,17 @@ dotnet run --project src/OrderCreation.Api
 ```
 
 Проект использует только встроенные возможности ASP.NET Core и не требует сторонних NuGet-пакетов.
+
+---
+
+## Задание 2 — SignalR и автоматическая отмена ордеров
+
+Готовое решение находится в проекте `src/OrderRealtime.Api`. Подробный разбор компонентов и принятых решений: [docs/task-2.md](docs/task-2.md).
+
+Запуск:
+
+```bash
+dotnet run --project src/OrderRealtime.Api
+```
+
+После запуска нужно открыть адрес приложения в браузере. Страница проверки подключается к `/hub/orders`, создает ордер через `POST /api/orders`, получает событие создания и примерно через 15 секунд — событие автоматической отмены.
