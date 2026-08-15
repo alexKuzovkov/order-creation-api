@@ -1,120 +1,365 @@
-# Создание ордера в ASP.NET Core: разбор и решение
+# Order Creation API
 
-Небольшой технический разбор упрощенного метода создания ордера. Цель решения — не усложнить пример, а показать безопасный, читаемый и поддерживаемый подход на ASP.NET Core.
+[![CI](https://github.com/alexKuzovkov/order-creation-api/actions/workflows/ci.yml/badge.svg)](https://github.com/alexKuzovkov/order-creation-api/actions/workflows/ci.yml)
+![.NET](https://img.shields.io/badge/.NET-9.0-512BD4)
+![ASP.NET Core](https://img.shields.io/badge/ASP.NET%20Core-Web%20API-512BD4)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
 
-## Что не так в исходном коде
+**Production-oriented .NET 9 API sample focused on safe order creation, idempotency, authorization, domain invariants, consistent HTTP semantics, and automated testing.**
 
-1. **Пропущен `await`.** `CheckUserAccessAsync` возвращает `Task<bool>`, а не `bool`. Непосредственное исправление — `await CheckUserAccessAsync(...)`.
-2. **Асинхронный action не имеет суффикса `Async`.** По .NET naming conventions метод должен называться `CreateOrderAsync`. То же правило применено к сервисам и репозиториям.
-3. **Нельзя доверять `request.UserId`.** Клиент способен подставить чужой идентификатор. Пользователь определяется по проверенным claims, а право создания ордера — policy-based authorization через `[Authorize]`.
-4. **Нет входной валидации.** DataAnnotations проверяют форму запроса, а `[ApiController]` автоматически возвращает `ValidationProblemDetails`. Торговые правила остаются в application/domain layer.
-5. **Не защищены доменные инварианты.** Положительные цена и объем проверяются не только DTO, но и методом `Order.Create`, поскольку домен может вызываться не через HTTP.
-6. **`DateTime.Now` зависит от сервера.** Используется `TimeProvider.GetUtcNow()`: время хранится в UTC, а код легко тестировать.
-7. **Нет отмены запроса.** `CancellationToken` передается по всей асинхронной цепочке.
-8. **Контроллер выполняет слишком много обязанностей.** Создание вынесено в `ICreateOrderService`; контроллер отвечает только за HTTP-контракт.
-9. **Наружу возвращается entity.** Отдельный `OrderResponse` не связывает публичный API со способом хранения данных.
-10. **Неверный статус успеха.** Создание ресурса возвращает `201 Created` и его адрес вместо `200 OK`.
-11. **Локальный `catch (Exception)` классифицирует любой сбой как `400`.** Ошибки централизованно обрабатывает встроенный `IExceptionHandler`, ответы формируются как `ProblemDetails`.
-12. **`Console.WriteLine` не подходит для production.** Используется структурированный `ILogger` с `TraceId`.
-13. **Возможны дубликаты при повторе запроса.** `ClientOrderId` делает операцию идемпотентной. В реальной БД необходим уникальный индекс `(UserId, ClientOrderId)` — предварительный `SELECT` сам по себе не защищает от гонки.
-14. **Сохранение и уведомление могут разойтись.** Если БД сохранит ордер, а уведомление упадет, клиент повторит запрос. В production ордер и Outbox message следует записывать одной транзакцией, а уведомление отправлять фоновым обработчиком.
+This repository demonstrates how a seemingly simple `POST /orders` endpoint becomes an engineering problem once retries, concurrent requests, authentication, authorization, validation, user isolation, error contracts, and future persistence are considered.
 
-## Исправленный endpoint
+> The project intentionally keeps persistence in memory so the important API and application-layer decisions remain easy to inspect. The README explicitly separates guarantees implemented by the sample from guarantees that require a production database.
+
+## Highlights
+
+- **.NET 9 / ASP.NET Core**
+- Thin controllers and explicit application boundaries
+- Policy-based authorization
+- Demo header authentication that can be replaced by JWT/OIDC without changing business code
+- **Idempotent order creation** using `ClientOrderId`
+- Safe handling of **concurrent duplicate requests**
+- Conflict detection when the same idempotency key is reused with a different payload
+- Domain invariants in `Order.Create`
+- Explicit `OrderState` enum
+- Configurable max-notional trading rule
+- `201 Created` with a real GET resource route
+- User-isolated order lookup
+- Centralized **Problem Details** exception handling
+- `CancellationToken` propagation
+- `TimeProvider` for testable UTC time
+- Unit + API integration tests
+- Docker Compose
+- GitHub Actions with a full PowerShell E2E suite
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[API Client] --> Auth[Authentication / Authorization]
+    Auth --> Controller[OrdersController]
+    Controller --> Service[OrderService]
+    Service --> Validator[IOrderTradingValidator]
+    Service --> Domain[Order Domain Model]
+    Service --> Repository[IOrderRepository]
+    Repository --> Memory[(In-memory Store)]
+
+    Controller -. errors .-> Handler[GlobalExceptionHandler]
+    Service -. errors .-> Handler
+```
+
+### Responsibility split
+
+| Component | Responsibility |
+|---|---|
+| `OrdersController` | HTTP transport, status codes, route semantics |
+| `ICurrentUser` | Resolves the authenticated user from trusted claims |
+| `OrderService` | Normalization, idempotency workflow, orchestration |
+| `Order` | Domain invariants and immutable order state at creation |
+| `IOrderTradingValidator` | Business/trading rules |
+| `IOrderRepository` | Storage abstraction and atomic get-or-add semantics |
+| `GlobalExceptionHandler` | Stable Problem Details error contract |
+
+## Order lifecycle representation
+
+Orders use an explicit enum instead of string or boolean state:
 
 ```csharp
-[ApiController]
-[Route("api/v1/orders")]
-[Authorize(Policy = AuthorizationPolicies.CanCreateOrders)]
-public sealed class OrdersController(
-    ICreateOrderService orderService,
-    ICurrentUser currentUser) : ControllerBase
+public enum OrderState
 {
-    [HttpPost]
-    public async Task<ActionResult<OrderResponse>> CreateOrderAsync(
-        [FromBody] CreateOrderRequest request,
-        CancellationToken cancellationToken)
-    {
-        var command = new CreateOrderCommand(
-            currentUser.Id,
-            request.ClientOrderId,
-            request.Symbol,
-            request.Price,
-            request.Volume);
-
-        var order = await orderService.CreateOrderAsync(command, cancellationToken);
-
-        return Created($"/api/v1/orders/{order.Id}", order);
-    }
+    Active = 1,
+    Completed = 2,
+    Inactive = 3,
+    Faulted = 4
 }
 ```
 
-Контроллер намеренно тонкий: авторизацию выполняет ASP.NET Core, транспортную валидацию — `[ApiController]` и DataAnnotations, бизнес-операцию — сервис, обработку ошибок — `IExceptionHandler`.
+The creation API creates an order in `Active` state. Lifecycle transitions are intentionally outside the scope of this repository; they are represented in the separate real-time order project.
 
-## Валидация запроса
+JSON serializes the state as a string:
 
-```csharp
-public sealed record CreateOrderRequest
+```json
 {
-    [Required]
-    [StringLength(20, MinimumLength = 1)]
-    [RegularExpression(@"^[A-Za-z0-9._/-]+$")]
-    public required string Symbol { get; init; }
-
-    [Range(typeof(decimal), "0.00000001", "1000000000000",
-        ParseLimitsInInvariantCulture = true)]
-    public decimal Price { get; init; }
-
-    [Range(typeof(decimal), "0.00000001", "1000000000000",
-        ParseLimitsInInvariantCulture = true)]
-    public decimal Volume { get; init; }
-
-    [Required, StringLength(100, MinimumLength = 8)]
-    public required string ClientOrderId { get; init; }
+  "state": "active"
 }
 ```
 
-`decimal` выбран для цены и объема, чтобы не получать двоичные ошибки округления `double`. DataAnnotations отвечают только за корректность HTTP-запроса. Проверки существования инструмента, торговой сессии, tick size, lot size, баланса и лимитов выполняет `IOrderTradingValidator`.
+## Idempotent creation
 
-## Обработка ошибок
+Clients send a stable `ClientOrderId`.
 
-В `Program.cs` регистрируется штатный механизм ASP.NET Core:
+The effective idempotency key is:
 
-```csharp
-builder.Services.AddProblemDetails();
-builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
-
-app.UseExceptionHandler();
+```text
+(UserId, ClientOrderId)
 ```
 
-`GlobalExceptionHandler : IExceptionHandler` преобразует известные ошибки в единый контракт:
+The behavior is deliberate:
 
-| Ситуация | HTTP-код |
+| Request | Result |
+|---|---|
+| First request | `201 Created` |
+| Same key + same payload | `200 OK`, existing order |
+| Same key + different payload | `409 Conflict` |
+| Concurrent retries with same payload | exactly one order is stored |
+
+The in-memory repository uses `ConcurrentDictionary.GetOrAdd` as the atomic gate, so concurrent requests do not create several process-local orders.
+
+### Production persistence
+
+A database-backed implementation should move the final guarantee to a unique constraint:
+
+```text
+UNIQUE (UserId, ClientOrderId)
+```
+
+A pre-insert `SELECT` is not enough because two requests can pass the check concurrently. The database constraint must remain the source of truth.
+
+## HTTP semantics
+
+### Create order
+
+```http
+POST /api/v1/orders
+X-User-Id: <guid>
+X-Permissions: orders:create
+Content-Type: application/json
+```
+
+```json
+{
+  "clientOrderId": "client-order-001",
+  "symbol": "btcusd",
+  "price": 100,
+  "volume": 2
+}
+```
+
+First successful request:
+
+```text
+201 Created
+Location: /api/v1/orders/{orderId}
+```
+
+An idempotent retry returns:
+
+```text
+200 OK
+```
+
+### Read order
+
+```http
+GET /api/v1/orders/{orderId}
+X-User-Id: <guid>
+```
+
+The API returns `404` when the order does not exist **or belongs to another user**, avoiding cross-user resource disclosure.
+
+## Authentication and authorization
+
+The sample includes a lightweight header-based authentication handler for local testing:
+
+```text
+X-User-Id: <guid>
+X-Permissions: orders:create
+```
+
+This is intentionally a demo adapter. In production it should be replaced by JWT Bearer / OpenID Connect while the controller and application service remain unchanged.
+
+Order creation requires the policy:
+
+```text
+CanCreateOrders
+```
+
+which requires the claim:
+
+```text
+permission = orders:create
+```
+
+## Validation layers
+
+The project separates three kinds of validation.
+
+### Transport validation
+
+DataAnnotations validate the HTTP request shape. `[ApiController]` automatically returns `400 ValidationProblemDetails`.
+
+### Domain invariants
+
+`Order.Create` independently verifies invariants such as:
+
+- non-empty user id
+- required `ClientOrderId`
+- required symbol
+- positive price
+- positive volume
+
+This prevents invalid domain objects even when the domain is called outside HTTP.
+
+### Trading rules
+
+`OrderTradingValidator` enforces configurable business rules. The sample includes `MaxNotional`:
+
+```json
+{
+  "OrderTrading": {
+    "MaxNotional": 10000000
+  }
+}
+```
+
+A violation returns `422 Unprocessable Entity`.
+
+## Error contract
+
+Application and domain failures are mapped centrally through `IExceptionHandler` and Problem Details. Authentication and authorization status codes are produced by the ASP.NET Core security middleware.
+
+| Situation | HTTP status |
 |---|---:|
-| Невалидный DTO | 400 |
-| Нет аутентификации | 401 |
-| Недостаточно прав | 403 |
-| Дубликат `ClientOrderId` | 409 |
-| Нарушено торговое правило | 422 |
-| Неожиданная ошибка | 500 |
+| Invalid DTO | 400 |
+| Missing authentication | 401 |
+| Missing create permission | 403 |
+| Same idempotency key, different payload | 409 |
+| Domain/trading rule violation | 422 |
+| Missing or another user's resource | 404 |
+| Unexpected failure | 500 |
 
-Клиент получает безопасный `ProblemDetails` с `traceId`; исключение и stack trace остаются в структурированных логах.
+Unexpected exception details remain in logs; clients receive a stable safe response with `traceId`.
 
-## Production-замечания
+## Transactional Outbox — production evolution
 
-Демонстрационный `InMemoryOrderRepository` нужен только для компактности примера. В реальной реализации:
+The current in-memory implementation does not publish integration events, so it does not pretend to provide a transactional outbox.
 
-- `Order` и `OutboxMessage` сохраняются одним `SaveChangesAsync` в одной транзакции;
-- в БД создается уникальный индекс `(UserId, ClientOrderId)`;
-- provider-specific `DbUpdateException` преобразуется инфраструктурным слоем в `DuplicateOrderException`;
-- фоновый Outbox processor публикует событие с retry/timeout и идемпотентным consumer;
-- право торговли конкретным инструментом и актуальные лимиты повторно проверяются непосредственно перед сохранением.
+A production persistence layer could evolve the write path to:
 
-Такое разделение оставляет endpoint коротким, делает зависимости явными и не смешивает HTTP, доменную логику, хранение данных и интеграции.
+```text
+Database transaction
+      │
+      ├── Order
+      └── OutboxMessage
+              │
+              ▼
+           COMMIT
+              │
+              ▼
+       Outbox Publisher
+              │
+              ▼
+        Message Broker
+```
 
-## Запуск
+The order row and outbox row should be committed atomically. A bounded background publisher can then deliver messages with retry/backoff and idempotent event identifiers.
+
+## Repository structure
+
+```text
+order-creation-api/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── src/
+│   └── OrderCreation.Api/
+│       ├── Application/
+│       ├── Authentication/
+│       ├── Contracts/
+│       ├── Controllers/
+│       ├── Domain/
+│       ├── Infrastructure/
+│       ├── Program.cs
+│       └── appsettings.json
+├── tests/
+│   └── OrderCreation.Api.Tests/
+├── Dockerfile
+├── docker-compose.yml
+├── test_all.ps1
+├── test_all.sh
+└── README.md
+```
+
+## Testing
+
+### Unit and API integration tests
+
+```bash
+dotnet test tests/OrderCreation.Api.Tests/OrderCreation.Api.Tests.csproj
+```
+
+Coverage includes:
+
+- domain invariants
+- default order state
+- concurrent repository idempotency
+- user isolation
+- same-payload retries
+- conflicting idempotency payloads
+- concurrent service retries
+- max-notional validation
+- authentication and authorization
+- `201` / `200` / `401` / `403` / `409` / `404` API behavior
+
+### Full PowerShell E2E
+
+```powershell
+.\test_all.ps1 -StartServices
+```
+
+The same command runs in GitHub Actions against the Dockerized API.
+
+The E2E suite verifies:
+
+1. health
+2. authentication and authorization
+3. request validation
+4. create + GET route semantics
+5. `OrderState.Active`
+6. idempotent retries
+7. conflicting idempotency payloads
+8. user isolation
+9. trading-rule validation
+10. missing resources
+
+## Run locally
+
+### Docker
+
+```bash
+docker compose up --build
+```
+
+API:
+
+```text
+http://localhost:5000
+```
+
+Health:
+
+```text
+http://localhost:5000/health
+```
+
+### .NET CLI
 
 ```bash
 dotnet run --project src/OrderCreation.Api
 ```
 
-Проект использует только встроенные возможности ASP.NET Core и не требует сторонних NuGet-пакетов.
+## Engineering trade-offs
+
+This repository focuses on API correctness and request-processing guarantees rather than platform completeness.
+
+Deliberately outside the sample:
+
+- durable database persistence
+- external identity provider
+- message broker
+- transactional outbox implementation
+- secret management
+- distributed tracing backend
+- production rate limiting
+
+The in-memory repository provides process-local behavior only and must not be treated as a substitute for a database in a multi-instance production deployment.

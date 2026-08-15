@@ -8,14 +8,21 @@ namespace OrderCreation.Api.Controllers;
 
 [ApiController]
 [Route("api/v1/orders")]
-[Authorize(Policy = AuthorizationPolicies.CanCreateOrders)]
+[Authorize]
 public sealed class OrdersController(
-    ICreateOrderService orderService,
+    IOrderService orderService,
     ICurrentUser currentUser) : ControllerBase
 {
+    private const string GetOrderRouteName = "GetOrderById";
+
     [HttpPost]
+    [Authorize(Policy = AuthorizationPolicies.CanCreateOrders)]
     [ProducesResponseType<OrderResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<OrderResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
     public async Task<ActionResult<OrderResponse>> CreateOrderAsync(
         [FromBody] CreateOrderRequest request,
@@ -28,8 +35,30 @@ public sealed class OrdersController(
             request.Price,
             request.Volume);
 
-        var order = await orderService.CreateOrderAsync(command, cancellationToken);
+        var result = await orderService.CreateOrderAsync(command, cancellationToken);
 
-        return Created($"/api/v1/orders/{order.Id}", order);
+        if (!result.IsCreated)
+            return Ok(result.Order);
+
+        return CreatedAtRoute(
+            GetOrderRouteName,
+            new { orderId = result.Order.Id },
+            result.Order);
+    }
+
+    [HttpGet("{orderId:guid}", Name = GetOrderRouteName)]
+    [ProducesResponseType<OrderResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<OrderResponse>> GetOrderAsync(
+        Guid orderId,
+        CancellationToken cancellationToken)
+    {
+        var order = await orderService.GetOrderAsync(
+            currentUser.Id,
+            orderId,
+            cancellationToken);
+
+        return order is null ? NotFound() : Ok(order);
     }
 }
