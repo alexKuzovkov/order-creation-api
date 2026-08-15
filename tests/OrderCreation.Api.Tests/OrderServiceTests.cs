@@ -57,7 +57,7 @@ public sealed class OrderServiceTests
         var results = await Task.WhenAll(Enumerable.Range(0, 32)
             .Select(_ => service.CreateOrderAsync(command, CancellationToken.None)));
 
-        Assert.Single(results.Where(result => result.IsCreated));
+        Assert.Single(results, result => result.IsCreated);
         Assert.Single(results.Select(result => result.Order.Id).Distinct());
     }
 

@@ -26,7 +26,7 @@ public sealed class InMemoryOrderRepositoryTests
         var results = await Task.WhenAll(candidates.Select(order =>
             repository.GetOrAddAsync(order, CancellationToken.None)));
 
-        Assert.Single(results.Where(result => result.IsCreated));
+        Assert.Single(results, result => result.IsCreated);
         Assert.Single(results.Select(result => result.Order.Id).Distinct());
     }
 
