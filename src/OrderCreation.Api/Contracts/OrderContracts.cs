@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using OrderCreation.Api.Domain;
 
 namespace OrderCreation.Api.Contracts;
 
@@ -19,6 +20,7 @@ public sealed record CreateOrderRequest
 
     [Required]
     [StringLength(100, MinimumLength = 8)]
+    [RegularExpression(@".*\S.*", ErrorMessage = "ClientOrderId must contain a non-whitespace character.")]
     public required string ClientOrderId { get; init; }
 }
 
@@ -28,5 +30,5 @@ public sealed record OrderResponse(
     string Symbol,
     decimal Price,
     decimal Volume,
-    string Status,
+    OrderState State,
     DateTimeOffset CreatedAt);

@@ -1,0 +1,11 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      OrderTrading__MaxNotional: 10000000
+    ports:
+      - "5000:8080"
+    restart: unless-stopped
